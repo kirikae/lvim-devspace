@@ -1,0 +1,6 @@
+# Fallback config — only used when $HOME has no .tmux.conf of its own.
+set -g mouse on
+set -g default-terminal "xterm-256color"
+set -g history-limit 10000
+set -g status-style bg=colour235,fg=colour250
+set -g renumber-windows on

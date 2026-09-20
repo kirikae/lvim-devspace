@@ -1,0 +1,98 @@
+# Custom OpenShift DevSpaces / Eclipse Che editor definition.
+# Pattern mirrors che-code / che-idea: an init container ("injector") drops
+# static binaries onto a shared emptyDir volume, which gets merged into
+# whatever dev container the *user's own project devfile* declares. That's
+# what lets someone bring their own image with vim, neovim, or emacs
+# already installed — this plugin never bakes an editor in, only the
+# terminal transport (tmux + ttyd).
+#
+# Reference: https://eclipse.dev/che/docs/stable/administration-guide/configuring-editors-definitions/
+schemaVersion: 2.2.2
+metadata:
+  name: tmux-ttyd
+  displayName: "tmux + ttyd (bring your own editor)"
+  description: >-
+    Web terminal backed by tmux, served over ttyd. Pair it with any
+    dev container that has vim, neovim, or emacs installed — this
+    editor only supplies the terminal multiplexer and the browser
+    transport, not the text editor itself.
+  tags:
+    - Tech-Preview
+    - Custom
+    - Terminal
+  attributes:
+    title: tmux over ttyd
+    arch:
+      - x86_64
+    publisher: kirikae
+    version: 0.0.1
+    repository: https://github.com/kirikae/tmux-ttyd
+    firstPublicationDate: '2026-09-21'
+
+components:
+
+  # --- init container: copies static ttyd + tmux binaries onto the shared volume
+  - name: toolbox-injector
+    container:
+      image: quay.io/kirikae/tmux-ttyd-injector:1.0.0
+      command:
+        - /entrypoint-init-container.sh
+      volumeMounts:
+        - name: toolbox
+          path: /toolbox
+      memoryLimit: 128Mi
+      memoryRequest: 16Mi
+      cpuLimit: 250m
+      cpuRequest: 20m
+
+  # --- "runtime description": schema-only container whose volumeMounts,
+  # env, and endpoint get merged into the actual dev container the user
+  # picked in their own project's devfile (see README "merge-contribution").
+  # The image here is never really scheduled standalone — it's a stand-in.
+  - name: toolbox-runtime
+    attributes:
+      app.kubernetes.io/component: toolbox-runtime
+      app.kubernetes.io/part-of: tmux-ttyd.eclipse.org
+      controller.devfile.io/container-contribution: true
+    container:
+      image: quay.io/kirikae/tmux-ttyd-injector:1.0.0
+      volumeMounts:
+        - name: toolbox
+          path: /toolbox
+      memoryLimit: 256Mi
+      memoryRequest: 32Mi
+      cpuLimit: 500m
+      cpuRequest: 30m
+      endpoints:
+        - name: tmux-ttyd
+          attributes:
+            type: main
+            cookiesAuthEnabled: true
+            discoverable: false
+          targetPort: 7681
+          exposure: public
+          secure: true
+          protocol: https
+
+  # --- shared, ephemeral volume between the injector and the merged dev container
+  - name: toolbox
+    volume:
+      ephemeral: true
+
+events:
+  # Runs as a Kubernetes init container before the workspace pod's main
+  # containers start.
+  preStart:
+    - init-toolbox
+  # Runs once the workspace is fully up and the user opens the editor tab.
+  postStart:
+    - start-tmux-ttyd
+
+commands:
+  - id: init-toolbox
+    apply:
+      component: toolbox-injector
+  - id: start-tmux-ttyd
+    exec:
+      component: toolbox-runtime
+      commandLine: 'nohup /toolbox/entrypoint-volume.sh > /toolbox/entrypoint-logs.txt 2>&1 &'
