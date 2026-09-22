@@ -1,0 +1,78 @@
+# Sample *project* devfile — copy this to the root of your own repository.
+#
+# Two different devfiles are involved in a terminal DevSpace, and it is worth
+# being clear about which is which:
+#
+#   ../tmux-devspace/devfile.yaml  is an EDITOR definition. It is installed
+#     once, cluster-wide, by an administrator, and supplies only the terminal
+#     transport: tmux served over ttyd. It contains no text editor at all.
+#
+#   this file                      is a PROJECT devfile. It is committed to a
+#     repository and supplies the dev container — the image that actually has
+#     Neovim in it.
+#
+# That separation is the whole point: the editor definition works with any dev
+# container, and this image works with any editor definition. See ./README.md.
+schemaVersion: 2.2.2
+metadata:
+  name: nvim-udi-workspace
+
+attributes:
+  # Select the tmux + ttyd editor definition, formed as
+  # <publisher>/<name>/<version> from ../tmux-devspace/devfile.yaml's metadata.
+  # The administrator must have applied that ConfigMap first (see
+  # ../tmux-devspace/README.md); without it the workspace falls back to the
+  # cluster default editor, which will start but give you a browser IDE rather
+  # than a terminal.
+  che-editor: kirikae/tmux-ttyd/latest
+
+components:
+  - name: tools
+    attributes:
+      # The editor definition's toolbox volumeMount and the ttyd endpoint are
+      # merged INTO this container at start-up. Naming the target explicitly
+      # beats relying on the controller's "first container with mountSources"
+      # fallback, which silently picks the wrong one as soon as a devfile grows
+      # a second container (a database, a sidecar).
+      controller.devfile.io/merge-contribution: true
+    container:
+      # Swap to nvim-udi-base for a plugin-free editor without the language
+      # servers; it starts faster and is a much smaller pull.
+      image: ghcr.io/kirikae/terminal-devspaces/nvim-udi-ide:latest
+
+      # Language servers are the reason these numbers are not smaller.
+      # rust-analyzer and gopls are each happy to use a gigabyte on a large
+      # repository, and tsserver is not far behind. A workspace that gets
+      # OOM-killed mid-edit presents as "LSP randomly stopped working", so the
+      # limit is set where that does not happen rather than where it just fits.
+      # Trim it if you know which languages you actually use.
+      memoryRequest: 2Gi
+      memoryLimit: 6Gi
+      cpuRequest: 500m
+      cpuLimit: 4000m
+
+      # Where the repository is cloned. /projects is the Che convention.
+      sourceMapping: /projects
+      mountSources: true
+
+      volumeMounts:
+        - name: home
+          path: /home/user
+
+  # Persistent home directory.
+  #
+  # This is what makes the image's config optional. On the first start Che
+  # seeds this volume from the image; after that it is yours. Drop a
+  # ~/.config/nvim into it and the image's own config is no longer read at all
+  # — see "How the config gets overridden" in ./README.md.
+  #
+  # It also carries the things you would expect to survive a restart: shell
+  # history, undo history, ~/.tmux.conf, and git credentials.
+  #
+  # Remove this component (and the volumeMount above) for a throwaway
+  # workspace that always starts from the image defaults. Note that the
+  # cluster-wide `persistUserHome` CheCluster setting does the same job; if
+  # that is already enabled, this component is redundant.
+  - name: home
+    volume:
+      size: 2Gi

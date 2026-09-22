@@ -1,0 +1,48 @@
+# Tree-sitter languages compiled into the image, one per line. Blank lines and
+# '#' comments are ignored.
+#
+# These are built at image build time and land in /usr/share/nvim/vendor, so a
+# workspace gets working highlighting with no network access and no first-run
+# compile. Anything not listed here can still be added at runtime with
+# :TSInstall, which installs into the user's own home instead.
+
+bash
+c
+cpp
+css
+diff
+dockerfile
+git_config
+git_rebase
+gitcommit
+gitignore
+go
+gomod
+gosum
+gowork
+hcl
+html
+ini
+java
+javascript
+jq
+json
+json5
+lua
+luadoc
+make
+markdown
+markdown_inline
+python
+query
+regex
+rust
+sql
+terraform
+toml
+tsx
+typescript
+vim
+vimdoc
+xml
+yaml

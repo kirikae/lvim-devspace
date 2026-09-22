@@ -1,0 +1,91 @@
+# nvim-udi-base — Neovim on the Che/DevSpaces Universal Developer Image.
+#
+# Layer 1 of 2. This is the image you point a devfile's dev container at when
+# you want a terminal editor and nothing clever: a pinned Neovim, a plugin-free
+# system config, and the search tools the config expects. Layer 2
+# (../ide/Containerfile) builds on this one and adds Tree-sitter and LSP.
+#
+# The config lives in /etc/xdg/nvim, NOT in /home/user. That is deliberate: a
+# DevSpace with a persistent home mounts a PVC over /home/user, so anything the
+# image writes there is shadowed the moment someone brings their own home
+# directory. /etc/xdg is Neovim's documented system-wide fallback, so the image
+# defaults apply on a fresh workspace and get out of the way entirely once
+# ~/.config/nvim exists. See ../README.md.
+
+ARG BASE_IMAGE=quay.io/devfile/universal-developer-image:ubi9-latest
+FROM ${BASE_IMAGE}
+
+# Everything below installs into /usr and /etc, so it needs root. The UDI's
+# own uid is restored at the end.
+USER 0
+
+# ripgrep backs 'grepprg' and fd is there for the muscle memory; both come from
+# EPEL, which the UDI already has enabled.
+RUN dnf -y --setopt=install_weak_deps=False install ripgrep fd-find \
+ && dnf clean all \
+ && rm -rf /var/cache/dnf
+
+# Pinned Neovim. EPEL only carries 0.8, which predates vim.lsp.config and the
+# Tree-sitter runtime the IDE layer is built on, so take the upstream release
+# tarball instead. Checksums are pinned per arch and verified — GitHub release
+# assets are mutable in principle.
+ARG NVIM_VERSION=0.12.5
+ARG NVIM_SHA256_X86_64=bce0f56eda1f1b1db6eee8f4133d7a38813ea07933837dd1777411ca384c6875
+ARG NVIM_SHA256_ARM64=1aa5ca085249580ae0f91eb14f27ec0919773ff2d99a163d03f3d6c21ac29725
+RUN set -eux; \
+    case "$(uname -m)" in \
+      x86_64)  nvim_arch=x86_64; nvim_sha="${NVIM_SHA256_X86_64}" ;; \
+      aarch64) nvim_arch=arm64;  nvim_sha="${NVIM_SHA256_ARM64}"  ;; \
+      *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/nvim.tar.gz \
+      "https://github.com/neovim/neovim/releases/download/v${NVIM_VERSION}/nvim-linux-${nvim_arch}.tar.gz"; \
+    echo "${nvim_sha}  /tmp/nvim.tar.gz" | sha256sum -c -; \
+    mkdir -p /opt/nvim; \
+    tar -xzf /tmp/nvim.tar.gz -C /opt/nvim --strip-components=1; \
+    rm -f /tmp/nvim.tar.gz; \
+    ln -sf /opt/nvim/bin/nvim /usr/local/bin/nvim; \
+    ln -sf /opt/nvim/bin/nvim /usr/local/bin/vi; \
+    HOME=/tmp/build-home nvim --version; \
+    rm -rf /tmp/build-home
+
+# System-wide config, plus the empty drop-in directory the IDE layer fills.
+COPY config/ /etc/xdg/nvim/
+RUN mkdir -p /etc/xdg/nvim/devspace.d
+
+# XDG_CONFIG_DIRS defaults to /etc/xdg when unset, but Che injects a fair
+# amount of environment into the dev container and an explicit value costs
+# nothing. NVIM_APPNAME is left alone so users can still run alternate configs.
+ENV XDG_CONFIG_DIRS=/etc/xdg \
+    EDITOR=nvim \
+    VISUAL=nvim
+
+# Neovim's state and data directories, pre-created with the ownership the UDI
+# uses for everything else under /home/user (uid 10001, group 0, group-writable
+# so an arbitrary OpenShift UID in the root group can still write).
+#
+# Creating these explicitly is not a nicety. Any root RUN step that happens to
+# start Neovim inherits HOME=/home/user from the UDI and leaves .local behind
+# owned by root with mode 0700 — after which the workspace user cannot write
+# shada, undo history, or LSP logs, and every session opens on a wall of E886
+# errors. Root's Neovim invocations above are pointed at a throwaway HOME for
+# the same reason.
+RUN install -d -o 10001 -g 0 -m 0775 \
+      /home/user/.local \
+      /home/user/.local/share /home/user/.local/share/nvim \
+      /home/user/.local/state /home/user/.local/state/nvim
+
+USER 10001
+
+# Fail the build rather than ship a broken config. This runs as the workspace
+# user against the real HOME, so it checks two different things at once: that
+# the Lua actually parses, and that the user can write Neovim's state
+# directories — which is precisely what the ownership fix above exists for.
+RUN set -eux; \
+    nvim --headless \
+      -c 'lua assert(vim.g.devspace_config == "/etc/xdg/nvim", "system config was not sourced")' \
+      -c 'lua assert(vim.g.mapleader == " ", "keymaps module did not load")' \
+      -c 'lua assert(_G.devspace_statusline ~= nil, "ui module did not load")' \
+      -c 'lua assert(vim.uv.fs_access(vim.fn.stdpath("state"), "W"), "state dir not writable")' \
+      -c 'quitall'; \
+    rm -rf /home/user/.local/state/nvim/shada /home/user/.local/state/nvim/*.log
