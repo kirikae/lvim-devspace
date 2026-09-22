@@ -48,47 +48,6 @@ jobs:
         run: |
           echo "IMAGE_NAME=${IMAGE_NAME,,}" >>${GITHUB_ENV}
 
-      - name: Extract metadata for base image
-        id: meta-base
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=base
-            type=sha,prefix=base-
-
-      - name: Build and push Base Image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          target: lvim-base
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta-base.outputs.tags }}
-          labels: ${{ steps.meta-base.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Extract metadata for final image
-        id: meta-final
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest
-            type=raw,value=blesh
-            type=sha
-
-      - name: Build and push Final Image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          # Omitting 'target' automatically builds to the final stage in the Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta-final.outputs.tags }}
-          labels: ${{ steps.meta-final.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
       - name: Extract metadata for tmux-ttyd-injector image
         id: meta-tmux-ttyd-injector
         uses: docker/metadata-action@v5
@@ -96,7 +55,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/tmux-ttyd-injector
           tags: |
             type=raw,value=latest
-            type=raw,value=${{ steps.tag_version.outputs.new_version }},enable=${{ steps.tag_version.outputs.new_version != '' }}
+            type=raw,value=v${{ steps.tag_version.outputs.new_version }},enable=${{ steps.tag_version.outputs.new_version != '' }}
             type=sha
 
       - name: Build and push tmux-ttyd-injector Image
