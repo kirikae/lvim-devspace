@@ -73,7 +73,9 @@ USER 10001
 # that file. Note this runs via -c luafile, not -l: script mode skips the user
 # config, so none of /etc/xdg/nvim would be loaded and the test would check
 # nothing.
-COPY verify.lua /tmp/verify.lua
+# --chown matters: COPY writes root-owned files regardless of USER, and /tmp is
+# sticky, so the workspace user could not delete this again below.
+COPY --chown=10001:0 verify.lua /tmp/verify.lua
 RUN set -eux; \
     nvim --headless -c 'luafile /tmp/verify.lua' -c 'quitall'; \
     rm -f /tmp/verify.lua; \

@@ -26,6 +26,15 @@ NPM_DIR="${ROOT}/npm"
 : "${MARKSMAN_VERSION:?}" "${GOPLS_VERSION:?}"
 : "${NPM_PACKAGES:?}"
 
+# The version checks at the bottom of this script run as root, and the
+# lua-language-server wrapper writes its log and metadata under $HOME — which
+# the UDI sets to /home/user. Left alone, root would create
+# /home/user/.local/state/lua-language-server owned by root and mode 0755, and
+# the workspace user could then neither write it at runtime nor delete it in
+# the Containerfile's cleanup step. Same reasoning as vendor-treesitter.sh.
+export HOME=/tmp/vendor-lsp-home
+mkdir -p "${HOME}"
+
 mkdir -p "${BIN}" "${NPM_DIR}"
 
 case "$(uname -m)" in
@@ -154,5 +163,7 @@ fi
 clangd --version
 "${BIN}/bash-language-server" --version
 "${BIN}/typescript-language-server" --version
+
+rm -rf "${HOME}"
 
 echo "==> language servers vendored"
