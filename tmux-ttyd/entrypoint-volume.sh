@@ -35,4 +35,4 @@ exec "${TOOLBOX}/ttyd" \
   --writable \
   --port "${PORT}" \
   --client-option titleFixed="${SESSION}" \
-  "${TOOLBOX}/tmux" -f "${TMUX_CONF}" attach-session -t "${SESSION}"
+  "${TOOLBOX}/tmux" -f "${TMUX_CONF}" attach-session -A -s "${SESSION}"
