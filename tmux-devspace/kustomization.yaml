@@ -5,7 +5,7 @@ configMapGenerator:
     files:
       - devfile.yaml
     options:
-      disableNameSuffix: true
+      disableNameSuffixHash: true
       labels:
         app.kubernetes.io/component: editor-definition
         app.kubernetes.io/part-of: che.eclipse.org
