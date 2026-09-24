@@ -15,7 +15,7 @@
 # container, and this image works with any editor definition. See ./README.md.
 schemaVersion: 2.2.2
 metadata:
-  name: nvim-udi-workspace
+  name: neovim-workspace
 
 attributes:
   # Select the tmux + ttyd editor definition, formed as
@@ -36,16 +36,21 @@ components:
       # a second container (a database, a sidecar).
       controller.devfile.io/merge-contribution: true
     container:
-      # Swap to nvim-udi-base for a plugin-free editor without the language
-      # servers; it starts faster and is a much smaller pull.
-      image: ghcr.io/kirikae/terminal-devspaces/nvim-udi-ide:latest
+      # Both images live under the same repository and are told apart by the
+      # tag suffix. Swap -lsp for -base to get a plugin-free editor without the
+      # language servers: it starts faster and is a much smaller pull.
+      #
+      # latest-lsp moves; pin to a Neovim version — 0.12.5-lsp — for a workspace
+      # that should not change underneath you.
+      image: ghcr.io/kirikae/terminal-devspaces/neovim:latest-lsp
 
       # Language servers are the reason these numbers are not smaller.
       # rust-analyzer and gopls are each happy to use a gigabyte on a large
       # repository, and tsserver is not far behind. A workspace that gets
       # OOM-killed mid-edit presents as "LSP randomly stopped working", so the
       # limit is set where that does not happen rather than where it just fits.
-      # Trim it if you know which languages you actually use.
+      # Trim it if you know which languages you actually use, and trim it hard
+      # if you are running the -base tag.
       memoryRequest: 2Gi
       memoryLimit: 6Gi
       cpuRequest: 500m

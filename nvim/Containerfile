@@ -1,0 +1,343 @@
+# Neovim for Che/DevSpaces — one multi-stage build, two published images.
+#
+#   --target base   Neovim, a plugin-free system config, ripgrep and fd.
+#   --target lsp    base plus 40 Tree-sitter parsers and 12 language servers.
+#
+# Published as:
+#   ghcr.io/kirikae/terminal-devspaces/neovim:${NEOVIM_VERSION}-base
+#   ghcr.io/kirikae/terminal-devspaces/neovim:${NEOVIM_VERSION}-lsp
+#
+# The stage graph is deliberately shallow:
+#
+#   builder-base ──┐
+#                  ├─> base ──> builder-lsp ──┐
+#   ${BASE_IMAGE} ─┘    └────────────────────>├─> lsp
+#                                             ┘
+#
+# Every stage whose name does not start with "builder-" is a shipping image, and
+# nothing that only exists to build something is allowed into one. Downloads,
+# tarballs, compilers and toolchains stay in the builder stages; the shipping
+# stages receive finished directory trees via COPY --from, which is both smaller
+# and a single layer per tree.
+#
+# The config lives in /etc/xdg/nvim, NOT in /home/user. That is deliberate: a
+# DevSpace with a persistent home mounts a PVC over /home/user, so anything the
+# image writes there is shadowed the moment someone brings their own home
+# directory. /etc/xdg is Neovim's documented system-wide fallback, so the image
+# defaults apply on a fresh workspace and get out of the way entirely once
+# ~/.config/nvim exists. See ./README.md.
+#
+# --- Mirrors and air-gapped builds -------------------------------------------
+#
+# This build fetches from no hard-coded host: every one of them is a build
+# argument, so it runs on a laptop with no route to the internet as long as the
+# content is reachable somewhere. ./MIRRORS.md is the manifest — every URL this
+# build resolves, at the pins currently set. That is the list you hand to
+# whoever populates the mirror.
+#
+# The contract for a *_URL argument is that it is a BASE URL and the path below
+# it matches upstream exactly, so a path-preserving reverse proxy or artifact
+# repository is enough:
+#
+#   BASE_IMAGE              the UDI itself
+#   GITHUB_RELEASES_URL     <base>/<org>/<repo>/releases/download/<tag>/<asset>
+#   GITHUB_REPOS_URL        <base>/<org>/<repo>                    (git remotes)
+#   TREESITTER_GRAMMAR_URL  <base>/<org>/<repo>/archive/<rev>.tar.gz
+#   NODEJS_DIST_URL         <base>/v<version>/<tarball>, and SHASUMS256.txt
+#   NPM_REGISTRY_URL        an npm registry
+#   GOPROXY / GOSUMDB       Go module proxy and checksum database
+#
+# Three different mechanisms fetch from GitHub, and each needs its own handling
+# — which is why there are three GitHub arguments rather than one:
+#
+#   git    — redirected by a url.<mirror>.insteadOf rule written into
+#            /etc/gitconfig in the base stage, so it also catches clones this
+#            build never names: submodules, and anything a workspace user clones
+#            later. GITHUB_REPOS_URL.
+#   curl   — release assets, named explicitly at each call site.
+#            GITHUB_RELEASES_URL.
+#   curl   — nvim-treesitter fetches each of its 40 grammars as a source
+#            archive, from a URL carried in its own parser table, so the git
+#            redirect above does NOT apply. vendor-treesitter.sh rewrites those
+#            URLs before installing. TREESITTER_GRAMMAR_URL, which falls back to
+#            GITHUB_REPOS_URL because the two are the same host upstream — set
+#            it separately only if your git mirror cannot serve /archive/
+#            tarballs.
+#
+# Two things are deliberately NOT parameterised here, because they belong to the
+# environment rather than to this build:
+#
+#   dnf    — the UBI and EPEL repository URLs come from BASE_IMAGE. Build
+#            against a UDI derivative carrying your own /etc/yum.repos.d.
+#   TLS    — a mirror behind a private CA needs that CA trusted. Same answer, or
+#            whatever makes the mirror transparent in the first place.
+#
+# Proxies need nothing here: HTTP_PROXY, HTTPS_PROXY and NO_PROXY (and their
+# lowercase spellings) are predefined build arguments in both BuildKit and
+# Buildah, available in every stage without being declared.
+
+ARG BASE_IMAGE=quay.io/devfile/universal-developer-image:ubi9-latest
+
+ARG GITHUB_RELEASES_URL=https://github.com
+ARG GITHUB_REPOS_URL=https://github.com
+ARG NODEJS_DIST_URL=https://nodejs.org/dist
+ARG NPM_REGISTRY_URL=https://registry.npmjs.org
+# Empty falls back to GITHUB_REPOS_URL; see the note above.
+ARG TREESITTER_GRAMMAR_URL=
+ARG GOPROXY=https://proxy.golang.org,direct
+ARG GOSUMDB=sum.golang.org
+# Empty means "leave Go's default alone". Set to `local` for an air-gapped
+# build, so the Go toolchain never tries to fetch a newer one.
+ARG GOTOOLCHAIN=
+
+# Pinned Neovim. EPEL only carries 0.8, which predates vim.lsp.config and the
+# Tree-sitter runtime the LSP image is built on, so take the upstream release
+# tarball instead. Checksums are pinned per arch and verified — release assets
+# are mutable in principle, and a mirror is one more thing that can be wrong.
+ARG NEOVIM_VERSION=0.12.5
+ARG NEOVIM_SHA256_X86_64=bce0f56eda1f1b1db6eee8f4133d7a38813ea07933837dd1777411ca384c6875
+ARG NEOVIM_SHA256_ARM64=1aa5ca085249580ae0f91eb14f27ec0919773ff2d99a163d03f3d6c21ac29725
+
+
+# =============================================================================
+# builder-base — everything the base image needs fetched, built or checked.
+# =============================================================================
+FROM ${BASE_IMAGE} AS builder-base
+
+USER 0
+
+ARG GITHUB_RELEASES_URL
+ARG NEOVIM_VERSION
+ARG NEOVIM_SHA256_X86_64
+ARG NEOVIM_SHA256_ARM64
+
+# Unpacks to /opt/nvim and proves the binary runs before anything downstream
+# depends on it. HOME is pointed at a throwaway directory: the UDI sets
+# HOME=/home/user, and a root-owned ~/.local left behind here would be copied
+# into an image where the workspace user cannot write it.
+RUN set -eux; \
+    case "$(uname -m)" in \
+      x86_64)  nvim_arch=x86_64; nvim_sha="${NEOVIM_SHA256_X86_64}" ;; \
+      aarch64) nvim_arch=arm64;  nvim_sha="${NEOVIM_SHA256_ARM64}"  ;; \
+      *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/nvim.tar.gz \
+      "${GITHUB_RELEASES_URL}/neovim/neovim/releases/download/v${NEOVIM_VERSION}/nvim-linux-${nvim_arch}.tar.gz"; \
+    echo "${nvim_sha}  /tmp/nvim.tar.gz" | sha256sum -c -; \
+    mkdir -p /opt/nvim; \
+    tar -xzf /tmp/nvim.tar.gz -C /opt/nvim --strip-components=1; \
+    rm -f /tmp/nvim.tar.gz; \
+    rm -rf /opt/nvim/share/man; \
+    chmod -R a+rX /opt/nvim; \
+    HOME=/tmp/build-home /opt/nvim/bin/nvim --version; \
+    HOME=/tmp/build-home /opt/nvim/bin/nvim --version \
+      | grep -q "^NVIM v${NEOVIM_VERSION}\b"; \
+    rm -rf /tmp/build-home
+
+
+# =============================================================================
+# base — the shipping editor image.
+# =============================================================================
+FROM ${BASE_IMAGE} AS base
+
+LABEL org.opencontainers.image.description="Neovim on the devfile Universal Developer Image — plugin-free system config, no language servers"
+
+# Everything below installs into /usr and /etc, so it needs root. The UDI's own
+# uid is restored at the end.
+USER 0
+
+ARG GITHUB_REPOS_URL
+ARG NEOVIM_VERSION
+
+# ripgrep backs 'grepprg' and fd is there for the muscle memory; both come from
+# EPEL, which the UDI already has enabled. This is the only dnf transaction in
+# the image, so the metadata cache is dropped in the same layer.
+RUN dnf -y --setopt=install_weak_deps=False install ripgrep fd-find \
+ && dnf clean all \
+ && rm -rf /var/cache/dnf
+
+COPY --from=builder-base /opt/nvim /opt/nvim
+
+# One layer for everything that is a mkdir, a symlink or a config line.
+#
+# The /home/user directories are not a nicety. Any root RUN step that happens to
+# start Neovim inherits HOME=/home/user from the UDI and leaves .local behind
+# owned by root with mode 0700 — after which the workspace user cannot write
+# shada, undo history, or LSP logs, and every session opens on a wall of E886
+# errors. Pre-creating them with the ownership the UDI uses everywhere else
+# (uid 10001, group 0, group-writable so an arbitrary OpenShift UID in the root
+# group can still write) removes the whole class of problem.
+#
+# The gitconfig entry is what makes GITHUB_REPOS_URL transparent: git rewrites
+# any https://github.com/ remote to the mirror, so clones in the builder stages,
+# their submodules, the grammars nvim-treesitter fetches for itself, and
+# anything the workspace user clones later all follow it without being told.
+# With the default value the rule rewrites the URL to itself and does nothing.
+RUN set -eux; \
+    ln -sf /opt/nvim/bin/nvim /usr/local/bin/nvim; \
+    ln -sf /opt/nvim/bin/nvim /usr/local/bin/vi; \
+    mkdir -p /etc/xdg/nvim/devspace.d; \
+    install -d -o 10001 -g 0 -m 0775 \
+      /home/user/.local \
+      /home/user/.local/share /home/user/.local/share/nvim \
+      /home/user/.local/state /home/user/.local/state/nvim; \
+    printf '[url "%s/"]\n\tinsteadOf = https://github.com/\n' "${GITHUB_REPOS_URL}" >> /etc/gitconfig
+
+# XDG_CONFIG_DIRS defaults to /etc/xdg when unset, but Che injects a fair amount
+# of environment into the dev container and an explicit value costs nothing.
+# NVIM_APPNAME is left alone so users can still run alternate configs.
+ENV XDG_CONFIG_DIRS=/etc/xdg \
+    EDITOR=nvim \
+    VISUAL=nvim \
+    NEOVIM_VERSION=${NEOVIM_VERSION}
+
+# Last, because it is the thing most likely to change: everything above stays
+# cached across a config edit.
+COPY base/config/ /etc/xdg/nvim/
+
+USER 10001
+
+# Fail the build rather than ship a broken config. This runs as the workspace
+# user against the real HOME, so it checks two different things at once: that
+# the Lua actually parses, and that the user can write Neovim's state
+# directories — which is precisely what the ownership fix above exists for.
+RUN set -eux; \
+    nvim --headless \
+      -c 'lua assert(vim.g.devspace_config == "/etc/xdg/nvim", "system config was not sourced")' \
+      -c 'lua assert(vim.g.mapleader == " ", "keymaps module did not load")' \
+      -c 'lua assert(_G.devspace_statusline ~= nil, "ui module did not load")' \
+      -c 'lua assert(vim.uv.fs_access(vim.fn.stdpath("state"), "W"), "state dir not writable")' \
+      -c 'quitall'; \
+    rm -rf /home/user/.local/state/nvim/shada /home/user/.local/state/nvim/*.log
+
+
+# =============================================================================
+# builder-lsp — compiles the parsers and vendors the language servers.
+#
+# FROM base, because the parsers are built by the very Neovim that will load
+# them and nvim-treesitter needs it on PATH. Nothing produced here is installed
+# in place for the shipping image: the lsp stage copies two finished trees out
+# and leaves the toolchain behind.
+# =============================================================================
+FROM base AS builder-lsp
+
+USER 0
+
+ARG GITHUB_RELEASES_URL
+ARG GITHUB_REPOS_URL
+ARG TREESITTER_GRAMMAR_URL
+ARG NODEJS_DIST_URL
+ARG NPM_REGISTRY_URL
+ARG GOPROXY
+ARG GOSUMDB
+ARG GOTOOLCHAIN
+
+# Build-time toolchain only. tree-sitter-cli is needed for the grammars that
+# ship a grammar.js instead of pre-generated C; git is already in the UDI but is
+# named here so the build does not depend on that staying true.
+RUN dnf -y --setopt=install_weak_deps=False install \
+      tree-sitter-cli \
+      gcc-c++ \
+      git \
+ && dnf clean all \
+ && rm -rf /var/cache/dnf
+
+# --- Tree-sitter -------------------------------------------------------------
+ARG NVIM_TREESITTER_REF=f603a2f4da48728f80257fb5fbb90145fd1dc173
+COPY lsp/parsers.txt lsp/vendor-treesitter.sh /tmp/vendor/
+RUN set -eux; \
+    chmod +x /tmp/vendor/vendor-treesitter.sh; \
+    NVIM_TREESITTER_REF="${NVIM_TREESITTER_REF}" \
+    GITHUB_REPOS_URL="${GITHUB_REPOS_URL}" \
+    TREESITTER_GRAMMAR_URL="${TREESITTER_GRAMMAR_URL}" \
+    /tmp/vendor/vendor-treesitter.sh /tmp/vendor/parsers.txt
+
+# --- Language servers --------------------------------------------------------
+ARG NVIM_LSPCONFIG_REF=v2.11.0
+ARG NODE_VERSION=22.23.2
+ARG LUA_LS_VERSION=3.19.1
+ARG RUST_ANALYZER_VERSION=2026-09-21
+ARG MARKSMAN_VERSION=2026-02-08
+ARG GOPLS_VERSION=v0.23.0
+# typescript is pinned to 5.x on purpose: typescript-language-server drives
+# tsserver, and TypeScript 7 replaced it with a different native binary.
+ARG NPM_PACKAGES="bash-language-server@5.8.1 yaml-language-server@1.24.0 vscode-langservers-extracted@4.10.0 typescript-language-server@6.0.0 typescript@5.9.3 pyright@1.1.414"
+
+# nvim-lspconfig is vendored for its lsp/<name>.lua definitions only; Neovim
+# reads those straight off 'runtimepath', so none of its Lua modules are loaded
+# at runtime. The clone URL is the canonical one — /etc/gitconfig redirects it.
+RUN set -eux; \
+    git clone --quiet --filter=blob:none --branch "${NVIM_LSPCONFIG_REF}" \
+        https://github.com/neovim/nvim-lspconfig /usr/share/nvim/vendor/nvim-lspconfig; \
+    echo "${NVIM_LSPCONFIG_REF}" > /usr/share/nvim/vendor/nvim-lspconfig/.vendored-ref; \
+    rm -rf /usr/share/nvim/vendor/nvim-lspconfig/.git \
+           /usr/share/nvim/vendor/nvim-lspconfig/test \
+           /usr/share/nvim/vendor/nvim-lspconfig/doc; \
+    chmod -R a+rX /usr/share/nvim/vendor/nvim-lspconfig
+
+COPY lsp/vendor-lsp.sh /tmp/vendor/
+RUN set -eux; \
+    chmod +x /tmp/vendor/vendor-lsp.sh; \
+    /tmp/vendor/vendor-lsp.sh; \
+    rm -rf /tmp/vendor
+
+
+# =============================================================================
+# lsp — the shipping IDE image.
+#
+# FROM base, not FROM builder-lsp: the compilers, the Tree-sitter CLI and the
+# dnf metadata that produced these trees are not wanted in a workspace.
+# =============================================================================
+FROM base AS lsp
+
+LABEL org.opencontainers.image.description="Neovim on the devfile Universal Developer Image — Tree-sitter parsers and language servers vendored at build time"
+
+USER 0
+
+# clangd comes from dnf rather than an upstream LLVM release because LLVM
+# publishes no aarch64 Linux build — one install path for every architecture is
+# worth more here than a newer clangd. It is a runtime dependency, so unlike the
+# rest of the toolchain it is installed in the shipping image.
+RUN dnf -y --setopt=install_weak_deps=False install clang-tools-extra \
+ && dnf clean all \
+ && rm -rf /var/cache/dnf
+
+# One layer per finished tree, in the order they are least to most likely to
+# change, so a parser list edit does not invalidate the language servers.
+COPY --from=builder-lsp /opt/nvim-lsp /opt/nvim-lsp
+COPY --from=builder-lsp /usr/share/nvim/vendor /usr/share/nvim/vendor
+
+# /usr/local/bin is already on PATH for every shell and for Neovim's
+# vim.fn.executable() checks, which is how the Lua config decides which servers
+# to enable. The symlinks are recreated rather than copied because /usr/local/bin
+# in the builder also holds this image's own nvim links.
+RUN set -eux; \
+    for f in /opt/nvim-lsp/bin/*; do \
+      ln -sf "${f}" "/usr/local/bin/$(basename "${f}")"; \
+    done
+
+# Drop-ins extend the base config rather than replacing it: init.lua sources
+# everything in devspace.d after its own modules. A user config in
+# ~/.config/nvim still overrides the lot.
+COPY lsp/config/devspace.d/ /etc/xdg/nvim/devspace.d/
+
+USER 10001
+
+# Prove the layer works before publishing it. verify.lua starts every language
+# server for real and parses a buffer per language, because "the binary exists"
+# is not the same claim as "the editor works" — see the comment at the top of
+# that file. Note this runs via -c luafile, not -l: script mode skips the user
+# config, so none of /etc/xdg/nvim would be loaded and the test would check
+# nothing.
+#
+# --chown matters: COPY writes root-owned files regardless of USER, and /tmp is
+# sticky, so the workspace user could not delete this again below. Both COPY and
+# RUN are in the final layer pair, so the file and everything it leaves behind
+# net out to nothing.
+COPY --chown=10001:0 lsp/verify.lua /tmp/verify.lua
+RUN set -eux; \
+    nvim --headless -c 'luafile /tmp/verify.lua' -c 'quitall'; \
+    rm -f /tmp/verify.lua; \
+    rm -rf /home/user/.local/state/nvim/shada \
+           /home/user/.local/state/nvim/*.log \
+           /home/user/.local/state/lua-language-server

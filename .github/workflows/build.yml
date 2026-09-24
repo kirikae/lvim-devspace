@@ -7,7 +7,7 @@ on:
     branches: [ "main" ]
   schedule:
     # Run a weekly rebuild every Sunday at 02:00 UTC to pick up upstream security
-    # patches from Alpine (tmux-ttyd) and UBI (nvim-udi)
+    # patches from Alpine (tmux-ttyd) and UBI (nvim)
     - cron: '0 2 * * 0'
 
 env:
@@ -22,12 +22,6 @@ jobs:
       contents: write
       packages: write
 
-    services:
-      registry:
-        image: registry:2
-        ports:
-          - 5000:5000
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -40,20 +34,8 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           default_bump: patch
 
-      - name: Free up runner disk space
-        run: |
-          sudo rm -rf \
-            /usr/share/dotnet \
-            /usr/local/lib/android \
-            /opt/ghc \
-            /usr/local/share/boost \
-            "${AGENT_TOOLSDIRECTORY}"
-          df -h /
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: network=host
 
       - name: Log in to the Container registry
         if: github.event_name != 'pull_request'
@@ -87,46 +69,109 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Extract metadata for nvim-udi-base image
-        id: meta-nvim-udi-base
+  # nvim/ is a single multi-stage Containerfile producing two images that differ
+  # only by tag suffix. It gets its own job rather than sharing one with the
+  # image above: the LSP stage is large enough to want a runner's disk to
+  # itself, and the two builds have nothing to share.
+  build-and-push-neovim:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free up runner disk space
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            "${AGENT_TOOLSDIRECTORY}"
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the Container registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Downcase IMAGE_NAME
+        run: |
+          echo "IMAGE_NAME=${IMAGE_NAME,,}" >>${GITHUB_ENV}
+
+      # The Containerfile is the single source of truth for the Neovim version,
+      # because the same value has to reach the build (to fetch the tarball) and
+      # the tags (to name the images). Read it rather than repeating it here.
+      - name: Read Neovim version from the Containerfile
+        id: neovim_version
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^ARG NEOVIM_VERSION=//p' nvim/Containerfile | head -1)"
+          if [ -z "${version}" ]; then
+            echo "could not read ARG NEOVIM_VERSION from nvim/Containerfile" >&2
+            exit 1
+          fi
+          echo "version=${version}" >>"${GITHUB_OUTPUT}"
+
+      - name: Extract metadata for neovim base image
+        id: meta-neovim-base
         uses: docker/metadata-action@v5
         with:
-          images: |
-            name=localhost:5000/nvim-udi-base
-            name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/nvim-udi-base,enable=${{ github.event_name != 'pull_request' }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/neovim
+          # Both images share one repository, so every tag carries the stage as
+          # a suffix — without it the two builds would overwrite each other's
+          # sha- and latest tags.
+          flavor: |
+            latest=false
+            suffix=-base
           tags: |
+            type=raw,value=${{ steps.neovim_version.outputs.version }}
             type=raw,value=latest
-            type=raw,value=v${{ steps.tag_version.outputs.new_version }},enable=${{ steps.tag_version.outputs.new_version != '' }}
             type=sha
 
-      - name: Build and push nvim-udi-base Image
+      - name: Build and push neovim base image
         uses: docker/build-push-action@v5
         with:
-          context: ./nvim-udi/base
-          file: ./nvim-udi/base/Containerfile
-          push: true
-          tags: ${{ steps.meta-nvim-udi-base.outputs.tags }}
-          labels: ${{ steps.meta-nvim-udi-base.outputs.labels }}
+          context: ./nvim
+          file: ./nvim/Containerfile
+          target: base
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta-neovim-base.outputs.tags }}
+          labels: ${{ steps.meta-neovim-base.outputs.labels }}
 
-      - name: Extract metadata for nvim-udi-ide image
-        id: meta-nvim-udi-ide
+      - name: Extract metadata for neovim lsp image
+        id: meta-neovim-lsp
         uses: docker/metadata-action@v5
         with:
-          images: |
-            name=localhost:5000/nvim-udi-ide
-            name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/nvim-udi-ide,enable=${{ github.event_name != 'pull_request' }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/neovim
+          flavor: |
+            latest=false
+            suffix=-lsp
           tags: |
+            type=raw,value=${{ steps.neovim_version.outputs.version }}
             type=raw,value=latest
-            type=raw,value=v${{ steps.tag_version.outputs.new_version }},enable=${{ steps.tag_version.outputs.new_version != '' }}
             type=sha
 
-      - name: Build and push nvim-udi-ide Image
+      # Runs against the same Buildx instance as the step above, so the `base`
+      # stage is served from BuildKit's local cache rather than rebuilt: the
+      # published -lsp image is built on exactly the -base image just pushed.
+      # That is also why this step must stay in the same job.
+      - name: Build and push neovim lsp image
         uses: docker/build-push-action@v5
         with:
-          context: ./nvim-udi/ide
-          file: ./nvim-udi/ide/Containerfile
-          push: true
-          build-args: |
-            BASE_IMAGE=localhost:5000/nvim-udi-base:latest
-          tags: ${{ steps.meta-nvim-udi-ide.outputs.tags }}
-          labels: ${{ steps.meta-nvim-udi-ide.outputs.labels }}
+          context: ./nvim
+          file: ./nvim/Containerfile
+          target: lsp
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta-neovim-lsp.outputs.tags }}
+          labels: ${{ steps.meta-neovim-lsp.outputs.labels }}

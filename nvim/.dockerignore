@@ -1,0 +1,10 @@
+# The build context is this directory. Podman reads this file too when no
+# .containerignore is present, so one file covers both builders.
+#
+# Documentation and the sample devfile are for humans and are never COPYed.
+# MIRRORS.md in particular documents the build without being read by it — it
+# must not become an input, or it would be a second source of truth for the
+# pins that live in the Containerfile.
+README.md
+MIRRORS.md
+devfile.yaml
